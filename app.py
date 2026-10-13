@@ -1,7 +1,7 @@
 """
 Marketing Mix Model (MMM) engine — version 1.
 
-Upload five Excel files, collate and validate the data, preview it,
+Upload 1–5 Excel files, collate and validate the data, preview it,
 then choose 4–5 marketing channels (plus date and sales) for training prep.
 No regression or MMM model is implemented in this version.
 """
@@ -18,7 +18,8 @@ from model_training import train_and_evaluate
 # ---------------------------------------------------------------------------
 # Configuration constants
 # ---------------------------------------------------------------------------
-REQUIRED_FILE_COUNT = 5          # Exactly five Excel files must be uploaded
+MIN_FILE_COUNT = 1               # At least one Excel file must be uploaded
+MAX_FILE_COUNT = 5               # At most five Excel files may be uploaded
 MIN_CHANNELS = 4                 # More than 3 channels
 MAX_CHANNELS = 5                 # Less than 6 channels
 MISSING_MARKER = "*"             # Placeholder when a column is absent in a file
@@ -31,7 +32,7 @@ DATE_COLUMN_CANDIDATES = ("date", "Date", "DATE")  # Common date column names
 st.set_page_config(page_title="Marketing Mix Model engine", layout="wide")
 st.title("Marketing Mix Model engine")
 st.markdown(
-    "Upload **5 Excel (.xlsx) files**, review the collated dataset, "
+    "Upload **1 to 5 Excel (.xlsx) files**, review the collated dataset, "
     "then select **4 or 5 channel columns** plus **date** and **sales** for training prep."
 )
 
@@ -321,25 +322,35 @@ def build_training_table(final_data: pd.DataFrame, date_col: str) -> pd.DataFram
 # MAIN UI
 # =============================================================================
 
-# --- Step 1: Upload exactly five Excel files ---
+# --- Step 1: Upload between one and five Excel files ---
 st.header("1. Upload Excel files")
 uploaded_files = st.file_uploader(
-    "Choose exactly 5 Excel (.xlsx) files",
+    f"Choose {MIN_FILE_COUNT} to {MAX_FILE_COUNT} Excel (.xlsx) files",
     type=["xlsx"],
     accept_multiple_files=True,
-    help="All five files are required before collation runs.",
+    help=f"Upload at least {MIN_FILE_COUNT} and at most {MAX_FILE_COUNT} files before collation runs.",
 )
 
 if not uploaded_files:
-    st.info("Upload 5 Excel files to continue.")
+    st.info(f"Upload between {MIN_FILE_COUNT} and {MAX_FILE_COUNT} Excel files to continue.")
     st.stop()
 
-if len(uploaded_files) != REQUIRED_FILE_COUNT:
+file_count = len(uploaded_files)
+if file_count < MIN_FILE_COUNT:
     st.warning(
-        f"Please upload exactly {REQUIRED_FILE_COUNT} files. "
-        f"You have uploaded {len(uploaded_files)}."
+        f"Please upload at least {MIN_FILE_COUNT} file(s). "
+        f"You have uploaded {file_count}."
     )
     st.stop()
+
+if file_count > MAX_FILE_COUNT:
+    st.warning(
+        f"Please upload at most {MAX_FILE_COUNT} files. "
+        f"You have uploaded {file_count}."
+    )
+    st.stop()
+
+st.caption(f"{file_count} file(s) uploaded.")
 
 # --- Step 2: Read and collate ---
 st.header("2. Collated data preview")
@@ -518,5 +529,14 @@ else:
             width="stretch",
             hide_index=True,
         )
+
+        st.subheader("Actual vs predicted sales (test set)")
+        chart_df = evaluation["test_predictions"].copy()
+        chart_df[date_col] = pd.to_datetime(chart_df[date_col])
+        chart_df = (
+            chart_df.set_index(date_col)[["actual_sales", "predicted_sales"]]
+            .sort_index()
+        )
+        st.line_chart(chart_df)
     except ValueError as exc:
         st.error(f"Model training failed: {exc}")

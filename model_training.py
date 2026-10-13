@@ -2,8 +2,10 @@
 Ridge Regression training and evaluation for Marketing Mix Model (MMM).
 
 Accepts final_data from app.py (date, sales, and channel columns sorted
-chronologically), performs an 80/20 chronological train-test split,
-scales features, trains Ridge Regression, and reports accuracy metrics.
+chronologically), applies geometric adstock to each marketing channel,
+adds Fourier seasonality terms (weekly/monthly when data frequency supports
+them), performs an 80/20 chronological train-test split, scales features,
+trains Ridge Regression, and reports accuracy metrics.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from sklearn.preprocessing import StandardScaler
 
 TRAIN_RATIO = 0.8
 DEFAULT_RIDGE_ALPHA = 1.0
+ADSTOCK_DECAY_GRID = np.arange(0.0, 1.0, 0.1)
+ADSTOCK_OPTIMIZATION_ROUNDS = 2
 
 
 @dataclass
@@ -33,6 +37,9 @@ class TrainingResult:
     model: Ridge
     scaler: StandardScaler
     feature_columns: list[str]
+    channel_columns: list[str]
+    adstock_decays: dict[str, float]
+    seasonality_columns: list[str]
     date_col: str
     sales_col: str
     train_data: pd.DataFrame
@@ -70,6 +77,182 @@ def chronological_train_test_split(
     train_data = final_data.iloc[:split_idx].copy()
     test_data = final_data.iloc[split_idx:].copy()
     return train_data, test_data
+
+
+def geometric_adstock(
+    spend: np.ndarray,
+    decay: float,
+    initial_carryover: float = 0.0,
+) -> np.ndarray:
+    """
+    Apply geometric adstock: adstock[t] = spend[t] + decay * adstock[t - 1].
+
+    initial_carryover is the last adstocked value from a prior period (e.g.
+    end of training data when transforming the test set).
+    """
+    spend_arr = np.asarray(spend, dtype=float)
+    adstocked = np.empty_like(spend_arr)
+    previous = float(initial_carryover)
+
+    for idx, value in enumerate(spend_arr):
+        current = float(value) + decay * previous
+        adstocked[idx] = current
+        previous = current
+
+    return adstocked
+
+
+def infer_date_granularity(dates: pd.Series) -> str:
+    """Infer whether the series is daily, weekly, or monthly from date gaps."""
+    ordered = pd.to_datetime(dates, errors="coerce").sort_values().dropna()
+    if len(ordered) < 2:
+        return "daily"
+
+    median_gap_days = ordered.diff().dropna().dt.days.median()
+    if median_gap_days <= 2:
+        return "daily"
+    if median_gap_days <= 10:
+        return "weekly"
+    return "monthly"
+
+
+def build_seasonality_features(dates: pd.Series) -> pd.DataFrame:
+    """
+    Build sine/cosine Fourier features for weekly and monthly seasonality.
+
+    Ridge learns the coefficients, so near-zero weights mean little seasonal
+    effect. Sin/cos pairs let the model recover amplitude and phase.
+    """
+    dt = pd.to_datetime(dates, errors="coerce")
+    granularity = infer_date_granularity(dt)
+    features: dict[str, np.ndarray] = {}
+
+    if granularity == "daily":
+        day_of_week = dt.dt.dayofweek.to_numpy(dtype=float)
+        features["weekly_sin"] = np.sin(2 * np.pi * day_of_week / 7.0)
+        features["weekly_cos"] = np.cos(2 * np.pi * day_of_week / 7.0)
+
+        day_of_month = dt.dt.day.to_numpy(dtype=float)
+        days_in_month = dt.dt.days_in_month.to_numpy(dtype=float)
+        features["monthly_sin"] = np.sin(2 * np.pi * day_of_month / days_in_month)
+        features["monthly_cos"] = np.cos(2 * np.pi * day_of_month / days_in_month)
+
+        day_of_year = dt.dt.dayofyear.to_numpy(dtype=float)
+        days_in_year = np.where(dt.dt.is_leap_year, 366.0, 365.0)
+        features["yearly_sin"] = np.sin(2 * np.pi * day_of_year / days_in_year)
+        features["yearly_cos"] = np.cos(2 * np.pi * day_of_year / days_in_year)
+    elif granularity == "weekly":
+        week_of_year = dt.dt.isocalendar().week.to_numpy(dtype=float)
+        features["yearly_sin"] = np.sin(2 * np.pi * week_of_year / 52.0)
+        features["yearly_cos"] = np.cos(2 * np.pi * week_of_year / 52.0)
+    else:
+        month = dt.dt.month.to_numpy(dtype=float)
+        features["yearly_sin"] = np.sin(2 * np.pi * month / 12.0)
+        features["yearly_cos"] = np.cos(2 * np.pi * month / 12.0)
+
+    return pd.DataFrame(features, index=dates.index)
+
+
+def apply_adstock_to_channels(
+    data: pd.DataFrame,
+    channel_columns: list[str],
+    decays: dict[str, float],
+    carryover: dict[str, float] | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Transform raw channel spend columns with per-channel geometric adstock."""
+    adstocked = data[channel_columns].copy()
+    final_carryover: dict[str, float] = {}
+
+    for channel in channel_columns:
+        decay = decays.get(channel, 0.0)
+        initial = (carryover or {}).get(channel, 0.0)
+        adstocked[channel] = geometric_adstock(
+            data[channel].to_numpy(dtype=float),
+            decay=decay,
+            initial_carryover=initial,
+        )
+        final_carryover[channel] = float(adstocked[channel].iloc[-1])
+
+    return adstocked, final_carryover
+
+
+def build_model_features(
+    data: pd.DataFrame,
+    date_col: str,
+    channel_columns: list[str],
+    adstock_decays: dict[str, float],
+    carryover: dict[str, float] | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Combine adstocked channel spends with Fourier seasonality features."""
+    adstocked_channels, final_carryover = apply_adstock_to_channels(
+        data,
+        channel_columns,
+        adstock_decays,
+        carryover=carryover,
+    )
+    seasonality = build_seasonality_features(data[date_col])
+    features = pd.concat([adstocked_channels, seasonality], axis=1)
+    return features, final_carryover
+
+
+def _fit_ridge_mse(
+    X_train: np.ndarray,
+    y_train: pd.Series,
+    X_eval: np.ndarray,
+    y_eval: pd.Series,
+    alpha: float,
+) -> float:
+    """Fit Ridge on train features and return MSE on an evaluation slice."""
+    model = Ridge(alpha=alpha)
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_eval)
+    return float(mean_squared_error(y_eval, predictions))
+
+
+def select_adstock_decays(
+    train_data: pd.DataFrame,
+    date_col: str,
+    sales_col: str,
+    channel_columns: list[str],
+    alpha: float,
+    decay_grid: np.ndarray = ADSTOCK_DECAY_GRID,
+    optimization_rounds: int = ADSTOCK_OPTIMIZATION_ROUNDS,
+) -> dict[str, float]:
+    """
+    Select per-channel adstock decay rates by coordinate search on training MSE.
+
+    Seasonality features are always included so decay selection accounts for
+    seasonal structure in sales.
+    """
+    y_train = train_data[sales_col]
+    decays = {channel: 0.5 for channel in channel_columns}
+    seasonality = build_seasonality_features(train_data[date_col])
+
+    for _ in range(optimization_rounds):
+        for channel in channel_columns:
+            best_decay = decays[channel]
+            best_mse = np.inf
+
+            for decay in decay_grid:
+                trial_decays = decays.copy()
+                trial_decays[channel] = float(decay)
+
+                adstocked, _ = apply_adstock_to_channels(
+                    train_data, channel_columns, trial_decays
+                )
+                X = pd.concat([adstocked, seasonality], axis=1)
+
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X)
+
+                mse = _fit_ridge_mse(X_scaled, y_train, X_scaled, y_train, alpha)
+                if mse < best_mse:
+                    best_mse = mse
+                    best_decay = float(decay)
+
+            decays[channel] = best_decay
+
+    return decays
 
 
 def extract_features_and_target(
@@ -115,14 +298,15 @@ def train_ridge_model(
     alpha: float = DEFAULT_RIDGE_ALPHA,
 ) -> TrainingResult:
     """
-    Chronologically split final_data, scale features, and train Ridge Regression.
+    Chronologically split final_data, apply adstock and seasonality features,
+    scale features, and train Ridge Regression.
 
     Returns the trained model and all data needed for evaluation.
     """
-    feature_columns = [
+    channel_columns = [
         col for col in final_data.columns if col not in (date_col, sales_col)
     ]
-    required_cols = [date_col, sales_col] + feature_columns
+    required_cols = [date_col, sales_col] + channel_columns
     clean_data = final_data.dropna(subset=required_cols).reset_index(drop=True)
 
     if len(clean_data) < 2:
@@ -132,10 +316,35 @@ def train_ridge_model(
 
     train_data, test_data = chronological_train_test_split(clean_data, train_ratio)
 
-    X_train, y_train, feature_columns = extract_features_and_target(
-        train_data, date_col, sales_col
+    adstock_decays = select_adstock_decays(
+        train_data,
+        date_col=date_col,
+        sales_col=sales_col,
+        channel_columns=channel_columns,
+        alpha=alpha,
     )
-    X_test, y_test, _ = extract_features_and_target(test_data, date_col, sales_col)
+
+    X_train, train_carryover = build_model_features(
+        train_data,
+        date_col=date_col,
+        channel_columns=channel_columns,
+        adstock_decays=adstock_decays,
+    )
+    X_test, _ = build_model_features(
+        test_data,
+        date_col=date_col,
+        channel_columns=channel_columns,
+        adstock_decays=adstock_decays,
+        carryover=train_carryover,
+    )
+
+    seasonality_columns = [
+        col for col in X_train.columns if col not in channel_columns
+    ]
+    feature_columns = list(X_train.columns)
+
+    y_train = train_data[sales_col].copy()
+    y_test = test_data[sales_col].copy()
 
     scaler, X_train_scaled, X_test_scaled = scale_features(X_train, X_test)
 
@@ -149,6 +358,9 @@ def train_ridge_model(
         model=model,
         scaler=scaler,
         feature_columns=feature_columns,
+        channel_columns=channel_columns,
+        adstock_decays=adstock_decays,
+        seasonality_columns=seasonality_columns,
         date_col=date_col,
         sales_col=sales_col,
         train_data=train_data,
@@ -210,6 +422,9 @@ def evaluate_model(result: TrainingResult) -> dict[str, Any]:
         "train_size": len(result.train_data),
         "test_size": len(result.test_data),
         "feature_columns": result.feature_columns,
+        "channel_columns": result.channel_columns,
+        "adstock_decays": result.adstock_decays,
+        "seasonality_columns": result.seasonality_columns,
         "ridge_alpha": result.model.alpha,
         "coefficients": dict(zip(result.feature_columns, result.model.coef_)),
         "intercept": float(result.model.intercept_),
@@ -249,6 +464,13 @@ def print_evaluation_report(evaluation: dict[str, Any]) -> None:
     print(f"Test rows     : {evaluation['test_size']}")
     print(f"Features      : {', '.join(evaluation['feature_columns'])}")
     print(f"Ridge alpha   : {evaluation['ridge_alpha']}")
+    print()
+    print("Adstock decay rates (per channel):")
+    for channel, decay in evaluation["adstock_decays"].items():
+        print(f"  {channel}: {decay:.2f}")
+    print()
+    print("Seasonality features:")
+    print(f"  {', '.join(evaluation['seasonality_columns'])}")
     print()
 
     print("Training set metrics:")
@@ -293,13 +515,14 @@ if __name__ == "__main__":
     data_dir = Path(__file__).resolve().parent / "synthetic_data"
     excel_files = sorted(data_dir.glob("*.xlsx"))
 
-    if len(excel_files) < 5:
+    if not excel_files:
         print("Run test_streamlit.py first to generate synthetic_data/*.xlsx files.")
     else:
         dataframes = [
             pd.read_excel(f, engine="openpyxl").rename(columns=str.strip)
             for f in excel_files[:5]
         ]
+        print(f"Using {len(dataframes)} uploaded file(s) from synthetic_data/.")
         all_columns = sorted({col for df in dataframes for col in df.columns})
         aligned = [df.reindex(columns=all_columns) for df in dataframes]
         collated_df = pd.concat(aligned, ignore_index=True)

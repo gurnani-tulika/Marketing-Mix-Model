@@ -1,5 +1,5 @@
 """
-Generate five months of synthetic FMCG sales data for UI / MMM testing.
+Generate one to five months of synthetic FMCG sales data for UI / MMM testing.
 
 Each month is saved as a separate Excel file with a distinct column schema
 (date format, available channels, column naming). Sales are driven by a
@@ -215,12 +215,19 @@ def build_month_dataframe(
     return pd.concat(series_list, axis=1)
 
 
-def generate_all_files(output_dir: Path | None = None) -> list[Path]:
+def generate_all_files(
+    output_dir: Path | None = None,
+    file_count: int = 5,
+) -> list[Path]:
     """
-    Create five Excel files — one per month — with distinct column layouts.
+    Create Excel files — one per month — with distinct column layouts.
+
+    file_count must be between 1 and 5 (inclusive).
 
     Returns the list of written file paths.
     """
+    if not 1 <= file_count <= 5:
+        raise ValueError("file_count must be between 1 and 5.")
     out = output_dir or OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
 
@@ -302,7 +309,7 @@ def generate_all_files(output_dir: Path | None = None) -> list[Path]:
         },
     ]
 
-    for spec in month_specs:
+    for spec in month_specs[:file_count]:
         month = START_MONTH + spec["month_offset"]
         year = START_YEAR + (month - 1) // 12
         month = ((month - 1) % 12) + 1
@@ -332,20 +339,28 @@ def run_streamlit_app() -> None:
     st.set_page_config(page_title="FMCG synthetic data generator", layout="centered")
     st.title("FMCG synthetic sales data generator")
     st.markdown(
-        "Creates **5 Excel files** with varied column schemas for testing the "
+        "Creates **1 to 5 Excel files** with varied column schemas for testing the "
         "Marketing Mix Model upload UI. No models are fit — only synthetic data."
     )
 
     st.subheader("Output settings")
+    file_count = st.number_input(
+        "Number of files to generate",
+        min_value=1,
+        max_value=5,
+        value=5,
+        step=1,
+        help="Generate between 1 and 5 monthly Excel files.",
+    )
     custom_dir = st.text_input(
         "Output folder",
         value=str(OUTPUT_DIR),
-        help="Directory where the five .xlsx files will be written.",
+        help="Directory where the .xlsx files will be written.",
     )
 
-    if st.button("Generate 5 test files", type="primary"):
+    if st.button("Generate test files", type="primary"):
         try:
-            paths = generate_all_files(Path(custom_dir))
+            paths = generate_all_files(Path(custom_dir), file_count=int(file_count))
         except Exception as exc:
             st.error(f"Generation failed: {exc}")
             return
